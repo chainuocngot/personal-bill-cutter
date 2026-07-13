@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Document, Page, pdfjs } from "react-pdf"
-import { ChevronLeft, ChevronRight, Crop, Download, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, Crop, X } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import clsx from "clsx"
@@ -8,6 +8,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
+import ActionPanel from "@/components/ActionPanel"
 
 interface FilePreviewProps {
   files: File[]
@@ -27,14 +28,28 @@ const EXPORT_SCALE = 4
 const CONTAINER_WIDTH = 794
 const CONTAINER_HEIGHT = 1123 // A4
 
-// Cấu hình tờ A4 xuất ra để in: khổ dọc, lưới 2 cột x 2 hàng (4 ảnh/tờ),
-// mỗi ảnh được canh giữa trong ô của nó (giữ nguyên tỉ lệ, không méo ảnh).
+// Cấu hình tờ A4 xuất ra để in: khổ dọc, hỗ trợ nhiều layout lưới khác nhau
+// (2/4/6/8 ảnh/tờ), mỗi ảnh được canh giữa trong ô của nó (giữ nguyên tỉ lệ,
+// không méo ảnh).
 const A4_DPI = 300
 const A4_WIDTH_PX = Math.round(8.27 * A4_DPI) // ~2481px
 const A4_HEIGHT_PX = Math.round(11.69 * A4_DPI) // ~3507px
-const GRID_COLS = 2
-const GRID_ROWS = 2
 const CELL_PADDING_PX = Math.round(0.3 * A4_DPI) // lề trong mỗi ô
+
+export type LayoutOption = 2 | 4 | 6 | 8
+
+interface GridConfig {
+  cols: number
+  rows: number
+}
+
+// Số ảnh/tờ -> số cột x số hàng. Khổ dọc nên ưu tiên tối đa 2 cột.
+const LAYOUT_GRID: Record<LayoutOption, GridConfig> = {
+  2: { cols: 1, rows: 2 },
+  4: { cols: 2, rows: 2 },
+  6: { cols: 2, rows: 3 },
+  8: { cols: 2, rows: 4 },
+}
 
 interface SelectionRatio {
   x: number
@@ -43,7 +58,7 @@ interface SelectionRatio {
   height: number
 }
 
-type FileKind = "pdf" | "image"
+export type FileKind = "pdf" | "image"
 
 const getFileKind = (file: File): FileKind => {
   if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) {
@@ -52,7 +67,8 @@ const getFileKind = (file: File): FileKind => {
   return "image"
 }
 
-const FILE_KIND_LABEL: Record<FileKind, string> = {
+// eslint-disable-next-line react-refresh/only-export-components
+export const FILE_KIND_LABEL: Record<FileKind, string> = {
   pdf: "PDF",
   image: "ảnh",
 }
@@ -86,6 +102,8 @@ export default function FilePreview({
   const [isDragging, setIsDragging] = useState(false)
   const [isCropping, setIsCropping] = useState(false)
   const [isBuildingSheets, setIsBuildingSheets] = useState(false)
+  // Layout tờ A4: số ảnh/tờ do người dùng chọn (2, 4, 6 hoặc 8)
+  const [layout, setLayout] = useState<LayoutOption>(4)
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [croppedByKind, setCroppedByKind] = useState<
     Record<FileKind, { file: File; dataUrl: string }[]>
@@ -370,18 +388,75 @@ export default function FilePreview({
   }
 
   /**
+   * Xoay 1 ảnh (dataURL) 90 độ theo chiều kim đồng hồ, trả về dataURL mới.
+   * Chiều rộng/cao được hoán đổi cho nhau (canvas.width = img.height và
+   * ngược lại) vì ảnh xoay 90/270 độ sẽ đổi hướng ngang <-> dọc.
+   */
+  const rotateImageDataUrl90 = async (dataUrl: string): Promise<string> => {
+    const img = await loadImage(dataUrl)
+
+    const canvas = document.createElement("canvas")
+    canvas.width = img.height
+    canvas.height = img.width
+
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return dataUrl
+
+    ctx.translate(canvas.width / 2, canvas.height / 2)
+    ctx.rotate((90 * Math.PI) / 180)
+    ctx.drawImage(img, -img.width / 2, -img.height / 2)
+
+    return canvas.toDataURL("image/png")
+  }
+
+  // Xoay TẤT CẢ ảnh đã crop (cả 2 loại pdf + image) cùng lúc 90 độ, cập nhật
+  // lại luôn dataURL đã lưu trong `croppedByKind` -> ảnh xoay sẽ được dùng
+  // khi ghép tờ A4.
+  const [isRotatingAll, setIsRotatingAll] = useState(false)
+
+  const handleRotateAllCropped = async () => {
+    if (croppedImages.length === 0) return
+
+    setIsRotatingAll(true)
+    try {
+      const [rotatedPdf, rotatedImage] = await Promise.all([
+        Promise.all(
+          croppedByKind.pdf.map(async (r) => ({
+            ...r,
+            dataUrl: await rotateImageDataUrl90(r.dataUrl),
+          })),
+        ),
+        Promise.all(
+          croppedByKind.image.map(async (r) => ({
+            ...r,
+            dataUrl: await rotateImageDataUrl90(r.dataUrl),
+          })),
+        ),
+      ])
+
+      const next = { pdf: rotatedPdf, image: rotatedImage }
+      setCroppedByKind(next)
+      onCrop?.([...next.pdf, ...next.image])
+    } finally {
+      setIsRotatingAll(false)
+    }
+  }
+
+  /**
    * Ghép các ảnh crop thành các tờ A4 dọc, mỗi tờ chứa tối đa
-   * GRID_COLS x GRID_ROWS (mặc định 2x2 = 4) ảnh. Mỗi ảnh được scale để
-   * vừa khít trong ô của nó (giữ nguyên tỉ lệ, không méo) và canh giữa cả
-   * theo chiều ngang lẫn chiều dọc trong ô. Nếu số ảnh không chia hết cho
-   * số ô/tờ thì tờ cuối sẽ có ô trống.
+   * grid.cols x grid.rows ảnh (theo layout người dùng chọn: 2/4/6/8).
+   * Mỗi ảnh được scale để vừa khít trong ô của nó (giữ nguyên tỉ lệ, không
+   * méo) và canh giữa cả theo chiều ngang lẫn chiều dọc trong ô. Nếu số ảnh
+   * không chia hết cho số ô/tờ thì tờ cuối sẽ có ô trống.
    */
   const buildA4Sheets = async (
     images: { file: File; dataUrl: string }[],
+    grid: GridConfig,
   ): Promise<string[]> => {
-    const perSheet = GRID_COLS * GRID_ROWS
-    const cellWidth = A4_WIDTH_PX / GRID_COLS
-    const cellHeight = A4_HEIGHT_PX / GRID_ROWS
+    const { cols, rows } = grid
+    const perSheet = cols * rows
+    const cellWidth = A4_WIDTH_PX / cols
+    const cellHeight = A4_HEIGHT_PX / rows
 
     const sheets: string[] = []
 
@@ -401,8 +476,8 @@ export default function FilePreview({
       for (let idx = 0; idx < chunk.length; idx++) {
         const img = await loadImage(chunk[idx].dataUrl)
 
-        const col = idx % GRID_COLS
-        const row = Math.floor(idx / GRID_COLS)
+        const col = idx % cols
+        const row = Math.floor(idx / cols)
 
         const cellX = col * cellWidth
         const cellY = row * cellHeight
@@ -421,14 +496,21 @@ export default function FilePreview({
         ctx.drawImage(img, drawX, drawY, drawW, drawH)
       }
 
-      // Đường kẻ mảnh chia lưới, tiện cắt sau khi in
+      // Đường kẻ mảnh chia lưới theo đúng số cột/hàng của layout, tiện cắt
+      // sau khi in
       ctx.strokeStyle = "#dddddd"
       ctx.lineWidth = 2
       ctx.beginPath()
-      ctx.moveTo(A4_WIDTH_PX / 2, 0)
-      ctx.lineTo(A4_WIDTH_PX / 2, A4_HEIGHT_PX)
-      ctx.moveTo(0, A4_HEIGHT_PX / 2)
-      ctx.lineTo(A4_WIDTH_PX, A4_HEIGHT_PX / 2)
+      for (let c = 1; c < cols; c++) {
+        const x = c * cellWidth
+        ctx.moveTo(x, 0)
+        ctx.lineTo(x, A4_HEIGHT_PX)
+      }
+      for (let r = 1; r < rows; r++) {
+        const y = r * cellHeight
+        ctx.moveTo(0, y)
+        ctx.lineTo(A4_WIDTH_PX, y)
+      }
       ctx.stroke()
 
       sheets.push(canvas.toDataURL("image/png"))
@@ -452,7 +534,7 @@ export default function FilePreview({
 
     setIsBuildingSheets(true)
     try {
-      const sheets = await buildA4Sheets(croppedImages)
+      const sheets = await buildA4Sheets(croppedImages, LAYOUT_GRID[layout])
       sheets.forEach((dataUrl, i) => {
         const link = document.createElement("a")
         link.href = dataUrl
@@ -482,8 +564,8 @@ export default function FilePreview({
         })}
       >
         <div className="flex items-center justify-between border-b p-4">
-          <div>
-            <h3 className="text-lg font-semibold mb-2">
+          <div className="max-w-[70%]">
+            <h3 className="text-lg font-semibold mb-2 truncate">
               {files[selectedFileIndex].name}
             </h3>
 
@@ -502,7 +584,7 @@ export default function FilePreview({
               <ChevronLeft size={16} />
             </Button>
 
-            <span className="text-sm">
+            <span className="text-sm whitespace-nowrap">
               {page} / {numPages}
             </span>
 
@@ -620,68 +702,20 @@ export default function FilePreview({
           )}
 
           {croppedImages.length > 0 && (
-            <CardContent className="flex flex-col gap-3 p-4">
-              <ScrollArea className="max-h-140">
-                <div className="flex flex-wrap gap-3 pr-4">
-                  {croppedImages.map(({ file, dataUrl }) => (
-                    <div
-                      key={file.name}
-                      className="flex flex-col items-center gap-1"
-                    >
-                      <img
-                        src={dataUrl}
-                        alt={`Cropped ${file.name}`}
-                        className="max-h-32 rounded border"
-                      />
-                      <p className="max-w-32 truncate text-xs text-muted-foreground">
-                        {file.name}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              </ScrollArea>
-
-              {!isCropComplete && (
-                <Alert>
-                  <AlertDescription className="space-y-1 text-xs text-orange-600">
-                    {pdfFiles.length > 0 && (
-                      <p>
-                        PDF: {croppedByKind.pdf.length}/{pdfFiles.length} file
-                        đã crop
-                      </p>
-                    )}
-                    {imageFiles.length > 0 && (
-                      <p>
-                        Ảnh: {croppedByKind.image.length}/{imageFiles.length}{" "}
-                        file đã crop
-                      </p>
-                    )}
-                    <p>
-                      Cần set vùng chọn và crop đủ{" "}
-                      {pdfFiles.length > 0 && imageFiles.length > 0
-                        ? "cả PDF và ảnh"
-                        : `${FILE_KIND_LABEL[currentFileKind]}`}{" "}
-                      thì mới tải về được.
-                    </p>
-                  </AlertDescription>
-                </Alert>
-              )}
-
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleDownloadSheets}
-                disabled={isBuildingSheets || !isCropComplete}
-                className="w-fit"
-              >
-                <Download size={16} className="mr-1" />
-                {isBuildingSheets
-                  ? "Đang ghép tờ A4..."
-                  : `Tải về khổ A4 (${Math.ceil(
-                      croppedImages.length / (GRID_COLS * GRID_ROWS),
-                    )} tờ)`}
-              </Button>
-            </CardContent>
+            <ActionPanel
+              handleRotateAllCropped={handleRotateAllCropped}
+              isRotatingAll={isRotatingAll}
+              croppedImages={croppedImages}
+              isCropComplete={isCropComplete}
+              pdfFiles={pdfFiles}
+              croppedByKind={croppedByKind}
+              imageFiles={imageFiles}
+              currentFileKind={currentFileKind}
+              handleDownloadSheets={handleDownloadSheets}
+              isBuildingSheets={isBuildingSheets}
+              layout={layout}
+              setLayout={setLayout}
+            />
           )}
         </Card>
       )}
